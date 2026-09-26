@@ -1,0 +1,128 @@
+# Off-box uptime monitor for trendmarketshifts.com.
+#
+# Why this lives in its own PUBLIC repo: standard GitHub-hosted runners are
+# free with no minute cap in public repositories, so this never touches the
+# private crypto-terminal repo's 2,000 included minutes (CI + deploy need them).
+# Keep it that way: ubuntu-latest only, no artifacts, no caches.
+#
+# Alerting: a FAILED run makes GitHub notify the user who last edited the cron
+# line (email + GitHub mobile push). To avoid an alert every 5 minutes during a
+# long outage, the job only FAILS when the site newly goes down, or once an hour
+# while it stays down. Every state change is committed to status.json, which
+# also keeps the repo "active" so GitHub never auto-disables the schedule
+# (scheduled workflows in public repos stop after 60 days without activity).
+
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Send a test alert (fails the run on purpose)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe the site
+        id: probe
+        run: |
+          check() {
+            h=$(curl -s -m 15 https://trendmarketshifts.com/api/v1/health || true)
+            c=$(curl -s -o /dev/null -w "%{http_code}" -m 15 https://trendmarketshifts.com/ || true)
+            echo "health=${h:-<none>} home=${c}"
+            echo "$h" | grep -q '"ok"' && [ "$c" = "200" ]
+          }
+          state=down
+          for i in 1 2 3; do
+            if check; then state=up; break; fi
+            [ $i -lt 3 ] && sleep 20
+          done
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
+      - name: Update status and decide whether to alert
+        id: decide
+        env:
+          STATE: ${{ steps.probe.outputs.state }}
+          FORCE: ${{ inputs.force_fail }}
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime as dt
+          now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+          iso = now.isoformat()
+          try:
+              s = json.load(open("status.json"))
+          except Exception:
+              s = {}
+          state = os.environ["STATE"]
+          prev = s.get("state")
+          changed = False
+          alert = False
+          if state == "down":
+              last = s.get("last_alert")
+              last_t = dt.datetime.fromisoformat(last) if last else None
+              if prev != "down":
+                  s["down_since"] = iso
+                  alert = True
+              elif last_t is None or (now - last_t).total_seconds() >= 3600:
+                  alert = True
+              if alert:
+                  s["last_alert"] = iso
+                  changed = True
+          else:
+              if prev == "down":
+                  s["last_recovery"] = iso
+                  s["last_outage_start"] = s.get("down_since")
+                  changed = True
+              s.pop("down_since", None)
+              s.pop("last_alert", None)
+              hb = s.get("heartbeat")
+              if hb is None or (now - dt.datetime.fromisoformat(hb)).days >= 7:
+                  s["heartbeat"] = iso
+                  changed = True
+          if prev != state:
+              changed = True
+          s["state"] = state
+          s["checked"] = iso
+          if changed:
+              json.dump(s, open("status.json", "w"), indent=2)
+              open("status.json", "a").write("\n")
+          force = os.environ.get("FORCE") == "true"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"changed={'true' if changed else 'false'}\n")
+              f.write(f"alert={'true' if (alert or force) else 'false'}\n")
+          print(f"state={state} prev={prev} changed={changed} alert={alert} force={force}")
+          PY
+
+      - name: Commit status
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          git config user.name "tms-uptime"
+          git config user.email "tms-uptime@users.noreply.github.com"
+          git add status.json
+          git commit -m "status: ${{ steps.probe.outputs.state }}" || exit 0
+          git push || true
+
+      - name: Alert
+        if: steps.decide.outputs.alert == 'true'
+        run: |
+          if [ "${{ inputs.force_fail }}" = "true" ]; then
+            echo "::error::TEST ALERT - the uptime monitor can reach you. Site state right now: ${{ steps.probe.outputs.state }}"
+          else
+            echo "::error::trendmarketshifts.com is DOWN (health or homepage failed 3 times, 20s apart)"
+          fi
+          exit 1
